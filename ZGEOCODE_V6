@@ -1,0 +1,263 @@
+*&---------------------------------------------------------------------*
+*& Report ZGEOCODE_V6
+*&---------------------------------------------------------------------*
+*&
+*&---------------------------------------------------------------------*
+REPORT zgeocode_v6.
+
+* Author: Esteban Wilder
+* DISCLAIMER
+* This is basic example to check if a customer address is correct or not
+* The program reads information from kna1, post the information to the WS
+* and prints the result. The result is taken from an API provided by google
+* to check addresses. If the address is incorrect, it suggest the correct address.
+* It no Postal Code is provided, the API returns it.
+* Keep in mind the following:
+*  - This is just an example
+*  - You might have to adapt this code to your S4 version
+*  - Before running this program, you should activate an API in Google Cloud Platform
+*  - Depending on your region, you can incur in cost while using this api
+*  - Depending on your region, you can have 300 usd credit for 3 months to test the Google Cloud Platform
+*  - Keep the API KEY safe and don't share it with anyone.
+*  - For a complete result, you should analise the complete response of each request!
+*     - In this example we only analyse on small part of the response
+*  - Enjoy, and feel free to make any improvement in the code
+*
+* The definition of the API  is in the following link:
+* https://developers.google.com/maps/documentation/address-validation/overview
+*
+* Take a look in the following link, to see how a result should be interpreted:
+* https://developers.google.com/maps/documentation/address-validation/understand-response
+*
+
+CONSTANTS:
+c_key type string value 'enter_your_google_api_key_here'.
+
+TABLES: kna1.
+
+*----- JSON Send Begin
+TYPES:
+
+*Address details determined by the API.
+  BEGIN OF ty_address_1,
+    region_code   TYPE string,
+    locality      TYPE string,
+    address_lines TYPE string_table,
+  END OF ty_address_1,
+
+  BEGIN OF ty_address_0,
+    address TYPE ty_address_1,
+  END OF ty_address_0,
+*----- JSON Send End
+
+*----- JSON Return Begin
+*TYPES:
+*Address details determined by the API.
+  BEGIN OF ty_veredict,
+    inputgranularity      TYPE string,
+    validationgranularity TYPE string,
+    geocodegranularity    TYPE string,
+    addresscomplete       TYPE abap_bool,
+    hasinferredcomponents TYPE abap_bool,
+  END OF ty_veredict,
+
+  BEGIN OF ty_result_int,
+    verdict TYPE ty_veredict,
+    address TYPE string,
+    geocode TYPE string,
+  END OF ty_result_int,
+
+  BEGIN OF ty_result,
+    responseid TYPE string,
+    result     TYPE ty_result_int,
+  END OF ty_result.
+*----- JSON Return End
+
+DATA: vl_veredict TYPE ty_veredict.
+
+DATA: vl_client               TYPE REF TO if_http_client,
+      ls_url                  TYPE string,
+      v_unescaped             TYPE string,
+      vl_http_rc              TYPE sysubrc,
+      vl_content              TYPE string,
+      vl_text                 TYPE string,
+      lv_request              TYPE string,
+      lv_content_length_value TYPE i,
+      lv_url                  TYPE string.
+
+SELECT-OPTIONS:
+  s_kunnr FOR kna1-kunnr.
+
+
+START-OF-SELECTION.
+
+  PERFORM f_get_customer.
+
+*&---------------------------------------------------------------------*
+*&      Form  F_GET_CUSTOMER
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM f_get_customer .
+
+  DATA: it_customers TYPE STANDARD TABLE OF kna1,
+        wa_customer  TYPE kna1,
+        vl_json      TYPE string,
+        vl_address_1 TYPE ty_address_1,
+        vl_address_0 TYPE ty_address_0,
+        vl_result    TYPE ty_result.
+
+* Select customers from table KNA1
+  SELECT *
+    FROM kna1
+    INTO TABLE it_customers
+    WHERE kunnr IN s_kunnr.
+
+  LOOP AT it_customers INTO wa_customer.
+    vl_address_1-region_code      = wa_customer-land1.
+    vl_address_1-locality        = wa_customer-ort01.
+
+    APPEND wa_customer-stras TO vl_address_1-address_lines.
+
+    vl_address_0-address = vl_address_1.
+
+* Create the json that will be sent
+    PERFORM f_create_json  USING vl_address_0
+                        CHANGING vl_json.
+
+* Send the json to the request
+    PERFORM f_check_address USING vl_json
+                        CHANGING  vl_result.
+
+* Analyse the result
+    PERFORM f_write_result USING vl_result
+                                 wa_customer.
+
+  ENDLOOP.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  F_CHECK_ADDRESS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_VL_ADDRESS  text
+*----------------------------------------------------------------------*
+FORM f_check_address  USING    p_vl_json    TYPE string
+                   CHANGING    p_vl_result  TYPE ty_result.
+
+  DATA:
+    lr_data   TYPE REF TO data,
+    vl_result TYPE ty_result.
+
+  CONCATENATE c_key
+              'https://addressvalidation.googleapis.com/v1:validateAddress?key='
+       into   lv_url.
+
+  CALL METHOD cl_http_client=>create_by_url
+    EXPORTING
+      url                = lv_url
+    IMPORTING
+      client             = vl_client
+    EXCEPTIONS
+      argument_not_found = 1
+      plugin_not_active  = 2
+      internal_error     = 3
+      OTHERS             = 4.
+
+* -- Example of JSON to be sent
+*  lv_request = '{"address": {"regionCode": "FR","locality": "Paris","addressLines": ["5 Av. Anatole"]}}'.
+  lv_request = p_vl_json.
+
+  lv_content_length_value = strlen( lv_request ).
+
+  vl_client->request->set_cdata(
+       EXPORTING
+           data = lv_request
+           length = lv_content_length_value
+            offset = 0 ).
+
+  CALL METHOD vl_client->request->set_header_field
+    EXPORTING
+      name  = 'Content-Type'
+      value = 'application/json'.
+
+  cl_http_utility=>set_request_uri( request = vl_client->request
+                    uri  = ls_url ).
+
+  CALL METHOD vl_client->send
+    EXCEPTIONS
+      http_communication_failure = 1
+      http_invalid_state         = 2
+      http_processing_failed     = 3
+      http_invalid_timeout       = 4
+      OTHERS                     = 5.
+
+  CALL METHOD vl_client->receive
+    EXCEPTIONS
+      http_communication_failure = 1
+      http_invalid_state         = 2
+      http_processing_failed     = 3
+      OTHERS                     = 4.
+
+  vl_client->response->get_status( IMPORTING code = vl_http_rc
+                                             reason = vl_text ).
+
+  vl_content = vl_client->response->get_cdata( ).
+
+  CALL METHOD /ui2/cl_json=>deserialize
+    EXPORTING
+      json         = vl_content
+      assoc_arrays = abap_true
+    CHANGING
+      data         = vl_result.
+
+  p_vl_result = vl_result.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  F_CREATE_JSON
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_VL_ADDRESS_0  text
+*      <--P_VL_JSON  text
+*----------------------------------------------------------------------*
+FORM f_create_json  USING    p_vl_address_0 TYPE ty_address_0
+                    CHANGING p_vl_json      TYPE string.
+  BREAK-POINT.
+  CALL METHOD /ui2/cl_json=>serialize
+    EXPORTING
+      data        = p_vl_address_0
+      pretty_name = /ui2/cl_json=>pretty_mode-camel_case
+    RECEIVING
+      r_json      = p_vl_json.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  F_WRITE_RESULT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_VL_RESULT  text
+*----------------------------------------------------------------------*
+FORM f_write_result  USING    p_vl_result TYPE ty_result
+                              p_customer TYPE kna1.
+
+  IF p_vl_result-result-verdict-inputgranularity      = 'PREMISE' AND
+     p_vl_result-result-verdict-validationgranularity = 'PREMISE' AND
+     p_vl_result-result-verdict-geocodegranularity    = 'PREMISE' AND
+     p_vl_result-result-verdict-addresscomplete       = 'X'       AND
+     p_vl_result-result-verdict-hasinferredcomponents = 'X'.
+
+    WRITE:/ 'Address correct ', p_customer-kunnr.
+
+  ELSE.
+
+    WRITE:/ 'Address should be reviewed ', p_customer-kunnr.
+
+  ENDIF.
+ENDFORM.
